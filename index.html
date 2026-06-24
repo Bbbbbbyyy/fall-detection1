@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>老人跌倒实时检测系统</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            text-align: center;
+            background-color: #f4f4f9;
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 16px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+        h1 { font-size: 20px; color: #4a5568; margin-bottom: 5px; }
+        h2 { font-size: 14px; color: #a0aec0; margin-top: 0; }
+        
+        #start-btn {
+            background-color: #007aff;
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            font-size: 18px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: bold;
+            margin: 20px 0;
+            box-shadow: 0 4px 6px rgba(0,122,255,0.3);
+            transition: all 0.2s;
+        }
+        #start-btn:active { transform: scale(0.95); }
+        
+        #status-panel {
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 12px;
+            font-size: 24px;
+            font-weight: bold;
+            background-color: #edf2f7;
+            color: #4a5568;
+        }
+        .danger {
+            background-color: #fff5f5 !important;
+            color: #e53e3e !important;
+            border: 2px solid #e53e3e;
+            animation: blink 1s infinite;
+        }
+        @keyframes blink {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        #debug-info {
+            margin-top: 25px;
+            font-size: 12px;
+            color: #718096;
+            text-align: left;
+            background: #f7fafc;
+            padding: 10px;
+            border-radius: 8px;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 id="project-title">跌倒检测加载中...</h1>
+        <h2 id="project-version"></h2>
+
+        <button id="start-btn">开启实时跌倒检测</button>
+
+        <div id="status-panel">未启动</div>
+
+        <div id="debug-info">滑动窗口初始化中...</div>
+    </div>
+
+    <script src="edge-impulse-standalone.js"></script>
+    <script src="run-impulse.js"></script>
+    
+    <script>
+        (async () => {
+            // 1. 初始化 Edge Impulse 分类器
+            var classifier = new EdgeImpulseClassifier();
+            await classifier.init();
+
+            // 显示项目信息
+            let project = classifier.getProjectInfo();
+            document.querySelector('#project-title').textContent = project.name;
+            document.querySelector('#project-version').textContent = 'Owner: ' + project.owner + ' (v' + project.deploy_version + ')';
+
+            // 2. 建立 6 秒滑动窗口缓存（假设手机传感器采集率稳定在 50Hz，6秒共 300 个点）
+            let accBuffer = [];  // 包含重力的合加速度
+            let gyroBuffer = []; // 陀螺仪合角速度
+            let linBuffer = [];  // 去除重力的纯动作线性合加速度
+
+            // 数学辅助函数：计算均值和标准差
+            function getStats(array) {
+                let mean = array.reduce((a, b) => a + b, 0) / array.length;
+                let std = Math.sqrt(array.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / array.length);
+                return { mean, std };
+            }
+            // 数学辅助函数：计算偏度 (Skewness)
+            function calcSkewness(array) {
+                let { mean, std } = getStats(array);
+                if (std === 0) return 0;
+                return array.reduce((a, b) => a + Math.pow((b - mean) / std, 3), 0) / array.length;
+            }
+            // 数学辅助函数：计算峰度 (Kurtosis)
+            function calcKurtosis(array) {
+                let { mean, std } = getStats(array);
+                if (std === 0) return 0;
+                return (array.reduce((a, b) => a + Math.pow((b - mean) / std, 4), 0) / array.length) - 3;
+            }
+
+            // 3. 按钮点击事件：处理 iOS 权限请求并启动监听
+            document.querySelector('#start-btn').onclick = () => {
+                if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+                    // iOS 13+ 特有权限申请弹窗
+                    DeviceMotionEvent.requestPermission()
+                        .then(permissionState => {
+                            if (permissionState === 'granted') {
+                                startSensorListening();
+                            } else {
+                                alert('权限被拒绝，iOS 无法读取传感器数据。');
+                            }
+                        })
+                        .catch(ex => alert('权限申请失败: ' + ex));
+                } else {
+                    // 安卓或非 iOS 设备直接启动
+                    startSensorListening();
+                }
+            };
+
+            // 4. 开启传感器监听与特征实时转换
+            function startSensorListening() {
+                document.querySelector('#start-btn').style.display = 'none';
+                document.querySelector('#status-panel').textContent = '正在积攒数据 (等待6秒)...';
+
+                window.addEventListener('devicemotion', (event) => {
+                    let acc = event.accelerationIncludingGravity; // 对应数据集 acc_
+                    let gyro = event.rotationRate;               // 对应数据集 gyro_
+                    let lin = event.acceleration;                  // 对应数据集 lin_
+
+                    // 兼容容错写法：只要基础的加速度和去重力加速度存在就继续执行
+                    if (!acc) return;
+
+                    // 计算当前瞬间的三轴合向量幅度（单位均为 iOS 原生的 m/s² 和 rad/s）
+                    let a_mag = Math.sqrt((acc.x || 0)**2 + (acc.y || 0)**2 + (acc.z || 0)**2);
+                    let g_mag = gyro ? Math.sqrt((gyro.alpha || 0)**2 + (gyro.beta || 0)**2 + (gyro.gamma || 0)**2) : 0;
+                    let l_mag = lin ? Math.sqrt((lin.x || 0)**2 + (lin.y || 0)**2 + (lin.z || 0)**2) : 0;
+
+                    // 推入滑动窗口队列
+                    accBuffer.push(a_mag);
+                    gyroBuffer.push(g_mag);
+                    linBuffer.push(l_mag);
+
+                    // 保持窗口内只有最近 6 秒的数据（50Hz * 6 = 300点）
+                    if (accBuffer.length > 300) {
+                        accBuffer.shift();
+                        gyroBuffer.shift();
+                        linBuffer.shift();
+                    }
+
+                    // 打印当前队列积攒进度
+                    if (accBuffer.length < 300) {
+                        document.querySelector('#debug-info').textContent = `正在初始化传感器窗口: ${accBuffer.length}/300 点\n(提示：如果数字卡住，请拿起手机轻微摇晃或倾斜它)`;
+                        return;
+                    }
+
+                    // 5. 窗口存满 300 个点，开始进行【9维特征提取与对齐】
+                    try {
+                        // 特征 1, 2, 5: 整个窗口内的最大值
+                        let acc_max = Math.max(...accBuffer);
+                        let gyro_max = Math.max(...gyroBuffer);
+                        let lin_max = Math.max(...linBuffer);
+
+                        // 特征 3, 4: 整个 6 秒窗口内的峰度 (Kurtosis)
+                        let acc_kurtosis = calcKurtosis(accBuffer);
+                        let gyro_kurtosis = calcKurtosis(gyroBuffer);
+
+                        // 特征 6, 7: 整个 6 秒窗口内的偏度 (Skewness)
+                        let acc_skewness = calcSkewness(accBuffer);
+                        let gyro_skewness = calcSkewness(gyroBuffer);
+
+                        // 特征 8, 9: 窗口第 6 秒时刻的最大值（即取数组最后 1 秒，约 50 个点的片段最大值）
+                        let post_gyro_slice = gyroBuffer.slice(250, 300);
+                        let post_lin_slice = linBuffer.slice(250, 300);
+                        let post_gyro_max = Math.max(...post_gyro_slice);
+                        let post_lin_max = Math.max(...post_lin_slice);
+
+                        // ！！！严格按照你的数据集维度顺序组装 9 维特征向量！！！
+                        let features = [
+                            acc_max, gyro_max, acc_kurtosis, gyro_kurtosis, 
+                            lin_max, acc_skewness, gyro_skewness, post_gyro_max, post_lin_max
+                        ];
+
+                        // 6. 塞入 Edge Impulse 的推理模型进行分类
+                        let res = classifier.classify(features);
+
+                        let statusPanel = document.querySelector('#status-panel');
+
+                        // 智能提取跌倒概率（兼容 Edge Impulse 不同的 Tabular/数组输出格式）
+                        let fallProbability = 0;
+                        if (res && res.classification && res.classification.fall !== undefined) {
+                            fallProbability = res.classification.fall;
+                        } else if (res && res.fall !== undefined) {
+                            fallProbability = res.fall;
+                        } else if (res && res.results && res.results.length > 0) {
+                            let fallObj = res.results.find(o => o.label === 'fall' || o.path === 'fall');
+                            fallProbability = fallObj ? fallObj.value : (res.results[0].value || 0);
+                        }
+
+                        // 默认显示正常监测中
+                        statusPanel.textContent = "🟢 正在实时监测中...";
+                        statusPanel.className = "";
+
+                        // 如果判定结果大于 0.5，说明极大可能跌倒了
+                        if (fallProbability > 0.5) {
+                            statusPanel.textContent = "⚠️ 检测到老人跌倒！";
+                            statusPanel.className = "danger";
+                        }
+
+                        // 打印底层调试数据，便于写论文或交作业时截图
+                        document.querySelector('#debug-info').textContent = 
+                            `【当前实时计算的 9 维输入特征】:\n` +
+                            `acc_max: ${acc_max.toFixed(4)}\n` +
+                            `gyro_max: ${gyro_max.toFixed(4)}\n` +
+                            `acc_kurtosis: ${acc_kurtosis.toFixed(4)}\n` +
+                            `gyro_kurtosis: ${gyro_kurtosis.toFixed(4)}\n` +
+                            `lin_max: ${lin_max.toFixed(4)}\n` +
+                            `acc_skewness: ${acc_skewness.toFixed(4)}\n` +
+                            `gyro_skewness: ${gyro_skewness.toFixed(4)}\n` +
+                            `post_gyro_max: ${post_gyro_max.toFixed(4)}\n` +
+                            `post_lin_max: ${post_lin_max.toFixed(4)}\n\n` +
+                            `【模型分类输出原始 JSON】:\n` + JSON.stringify(res, null, 2);
+
+                    } catch (ex) {
+                        console.error(ex);
+                        document.querySelector('#debug-info').textContent = '分类出错: ' + ex.message;
+                    }
+                });
+            }
+        })();
+    </script>
+</body>
+</html>
+</html>
